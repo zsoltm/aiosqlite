@@ -8,8 +8,8 @@ Core implementation of aiosqlite proxies
 import asyncio
 import logging
 import sqlite3
-import warnings
 import sys
+import warnings
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
@@ -198,7 +198,11 @@ class Connection(Thread):
         return self._conn.interrupt()
 
     async def create_function(
-        self, name: str, num_params: int, func: Callable, deterministic: bool = False,
+        self,
+        name: str,
+        num_params: int,
+        func: Callable,
+        deterministic: bool = False,
     ) -> None:
         """
         Create user-defined function that can be later used
@@ -229,7 +233,10 @@ class Connection(Thread):
                 )
 
             await self._execute(
-                self._conn.create_function, name, num_params, func,
+                self._conn.create_function,
+                name,
+                num_params,
+                func,
             )
 
     @property

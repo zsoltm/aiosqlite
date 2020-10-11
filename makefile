@@ -20,7 +20,7 @@ format:
 
 lint:
 	python -m pylint --rcfile .pylint aiosqlite/*.py
-	python -m isort --diff --recursive aiosqlite
+	python -m isort --diff aiosqlite
 	python -m black --check aiosqlite
 
 test:
