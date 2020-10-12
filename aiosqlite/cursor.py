@@ -2,15 +2,16 @@
 # Licensed under the MIT license
 
 import sqlite3
-from typing import TYPE_CHECKING, Any, Iterable, Optional, Tuple, Iterator
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional, Tuple
+
+from .w_thread import execute_blocking
 
 if TYPE_CHECKING:
     from .core import Connection
 
 
 class Cursor:
-    def __init__(self, conn: "Connection", cursor: sqlite3.Cursor) -> None:
-        self._conn = conn
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
         self._cursor = cursor
         self.__chunk: Optional[Iterator[sqlite3.Row]]
         self.iter_chunk_size = 1024
@@ -23,58 +24,57 @@ class Cursor:
     async def __anext__(self) -> sqlite3.Row:
         """Use `cursor.fetchone()` to provide an async iterable."""
         if self.__chunk is None:
-            self.__chunk = iter(await self.fetchmany(self.iter_chunk_size))
+            self.__chunk = await self.__fetch_anext_chunk()
 
         try:
             return self.__chunk.__next__()
         except StopIteration:
-            chunk = await self.fetchmany(self.iter_chunk_size)
-            if not chunk:
-                raise StopAsyncIteration
-            self.__chunk = iter(chunk)
+            self.__chunk = await self.__fetch_anext_chunk()
             return self.__chunk.__next__()
 
-    async def _execute(self, fn, *args, **kwargs):
-        """Execute the given function on the shared connection's thread."""
-        return await self._conn._execute(fn, *args, **kwargs)
+    async def __fetch_anext_chunk(self) -> Iterator[sqlite3.Row]:
+        chunk = await self.fetchmany(self.iter_chunk_size)
+        if not chunk:
+            raise StopAsyncIteration
+        return iter(chunk)
 
     async def execute(self, sql: str, parameters: Iterable[Any] = None) -> "Cursor":
         """Execute the given query."""
         if parameters is None:
             parameters = []
-        await self._execute(self._cursor.execute, sql, parameters)
+        await execute_blocking(self._cursor.execute, sql, parameters)
         return self
 
     async def executemany(
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> "Cursor":
         """Execute the given multiquery."""
-        await self._execute(self._cursor.executemany, sql, parameters)
+        await execute_blocking(self._cursor.executemany, sql, parameters)
         return self
 
     async def executescript(self, sql_script: str) -> "Cursor":
         """Execute a user script."""
-        await self._execute(self._cursor.executescript, sql_script)
+        await execute_blocking(self._cursor.executescript, sql_script)
         return self
 
     async def fetchone(self) -> Optional[sqlite3.Row]:
         """Fetch a single row."""
-        return await self._execute(self._cursor.fetchone)
+        return await execute_blocking(self._cursor.fetchone)
 
     async def fetchmany(self, size: int = None) -> Iterable[sqlite3.Row]:
         """Fetch up to `cursor.arraysize` number of rows."""
         args: Tuple[int, ...] = ()
         if size is not None:
             args = (size,)
-        return await self._execute(self._cursor.fetchmany, *args)
+        return await execute_blocking(self._cursor.fetchmany, *args)
 
     async def fetchall(self) -> Iterable[sqlite3.Row]:
         """Fetch all remaining rows."""
-        return await self._execute(self._cursor.fetchall)
+        return await execute_blocking(self._cursor.fetchall)
 
     async def close(self) -> None:
         """Close the cursor."""
-        await self._execute(self._cursor.close)
+        await execute_blocking(self._cursor.close)
 
     @property
     def rowcount(self) -> int:

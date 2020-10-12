@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from sqlite3 import OperationalError
 from threading import Thread
-from unittest import SkipTest, skipIf, skipUnless
+from unittest import SkipTest, skipIf, skipUnless, skip
 
 import aiounittest
 
@@ -74,6 +74,7 @@ class SmokeTest(aiounittest.AsyncTestCase):
                 cursor = await db.execute("select * from foo")
                 self.assertEqual(await cursor.fetchall(), rows)
 
+    @skip
     async def test_multiple_connections(self):
         async with aiosqlite.connect(TEST_DB) as db:
             await db.execute(

@@ -10,10 +10,8 @@ import logging
 import sqlite3
 import sys
 import warnings
-from functools import partial
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Thread
+from queue import SimpleQueue, Empty
 from typing import (
     Any,
     AsyncIterator,
@@ -28,20 +26,15 @@ from warnings import warn
 
 from .context import contextmanager
 from .cursor import Cursor
+from .w_thread import WorkerThreadExecutor, execute_blocking
 
 __all__ = ["connect", "Connection", "Cursor"]
+
 
 LOG = logging.getLogger("aiosqlite")
 
 
-def get_loop(future: asyncio.Future) -> asyncio.AbstractEventLoop:
-    if sys.version_info >= (3, 7):
-        return future.get_loop()
-    else:
-        return future._loop
-
-
-class Connection(Thread):
+class Connection:
     def __init__(
         self,
         connector: Callable[[], sqlite3.Connection],
@@ -51,8 +44,7 @@ class Connection(Thread):
         self._running = True
         self._connection: Optional[sqlite3.Connection] = None
         self._connector = connector
-        self._tx: Queue = Queue()
-
+        self.__executor: WorkerThreadExecutor = WorkerThreadExecutor()
         if loop is not None:
             warn(
                 "aiosqlite.Connection no longer uses the `loop` parameter",
@@ -79,41 +71,11 @@ class Connection(Thread):
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    def run(self) -> None:
-        """
-        Execute function calls on a separate thread.
-
-        :meta private:
-        """
-        while self._running:
-            try:
-                future, function = self._tx.get(timeout=0.1)
-            except Empty:
-                continue
-
-            try:
-                LOG.debug("executing %s", function)
-                result = function()
-                LOG.debug("returning %s", result)
-                get_loop(future).call_soon_threadsafe(future.set_result, result)
-            except BaseException as e:
-                LOG.info("returning exception %s", e)
-                get_loop(future).call_soon_threadsafe(future.set_exception, e)
-
-    async def _execute(self, fn, *args, **kwargs):
-        """Queue a function with the given arguments for execution."""
-        function = partial(fn, *args, **kwargs)
-        future = asyncio.get_event_loop().create_future()
-
-        self._tx.put_nowait((future, function))
-
-        return await future
-
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""
         if self._connection is None:
             try:
-                self._connection = await self._execute(self._connector)
+                self._connection = await execute_blocking(self._connector)
             except Exception:
                 self._running = False
                 self._connection = None
@@ -122,7 +84,6 @@ class Connection(Thread):
         return self
 
     def __await__(self) -> Generator[Any, None, "Connection"]:
-        self.start()
         return self._connect().__await__()
 
     async def __aenter__(self) -> "Connection":
@@ -134,20 +95,20 @@ class Connection(Thread):
     @contextmanager
     async def cursor(self) -> Cursor:
         """Create an aiosqlite cursor wrapping a sqlite3 cursor object."""
-        return Cursor(self, await self._execute(self._conn.cursor))
+        return Cursor(await execute_blocking(self._conn.cursor))
 
     async def commit(self) -> None:
         """Commit the current transaction."""
-        await self._execute(self._conn.commit)
+        await execute_blocking(self._conn.commit)
 
     async def rollback(self) -> None:
         """Roll back the current transaction."""
-        await self._execute(self._conn.rollback)
+        await execute_blocking(self._conn.rollback)
 
     async def close(self) -> None:
         """Complete queued queries/cursors and close the connection."""
         try:
-            await self._execute(self._conn.close)
+            await execute_blocking(self._conn.close)
         except Exception:
             LOG.exception("exception occurred while closing connection")
         self._running = False
@@ -158,8 +119,8 @@ class Connection(Thread):
         """Helper to create a cursor and execute the given query."""
         if parameters is None:
             parameters = []
-        cursor = await self._execute(self._conn.execute, sql, parameters)
-        return Cursor(self, cursor)
+        cursor = await execute_blocking(self._conn.execute, sql, parameters)
+        return Cursor(cursor)
 
     @contextmanager
     async def execute_insert(
@@ -168,7 +129,7 @@ class Connection(Thread):
         """Helper to insert and get the last_insert_rowid."""
         if parameters is None:
             parameters = []
-        return await self._execute(self._execute_insert, sql, parameters)
+        return await execute_blocking(self._execute_insert, sql, parameters)
 
     @contextmanager
     async def execute_fetchall(
@@ -177,32 +138,28 @@ class Connection(Thread):
         """Helper to execute a query and return all the data."""
         if parameters is None:
             parameters = []
-        return await self._execute(self._execute_fetchall, sql, parameters)
+        return await execute_blocking(self._execute_fetchall, sql, parameters)
 
     @contextmanager
     async def executemany(
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> Cursor:
         """Helper to create a cursor and execute the given multiquery."""
-        cursor = await self._execute(self._conn.executemany, sql, parameters)
-        return Cursor(self, cursor)
+        cursor = await execute_blocking(self._conn.executemany, sql, parameters)
+        return Cursor(cursor)
 
     @contextmanager
     async def executescript(self, sql_script: str) -> Cursor:
         """Helper to create a cursor and execute a user script."""
-        cursor = await self._execute(self._conn.executescript, sql_script)
-        return Cursor(self, cursor)
+        cursor = await execute_blocking(self._conn.executescript, sql_script)
+        return Cursor(cursor)
 
     async def interrupt(self) -> None:
         """Interrupt pending queries."""
         return self._conn.interrupt()
 
     async def create_function(
-        self,
-        name: str,
-        num_params: int,
-        func: Callable,
-        deterministic: bool = False,
+        self, name: str, num_params: int, func: Callable, deterministic: bool = False,
     ) -> None:
         """
         Create user-defined function that can be later used
@@ -217,7 +174,7 @@ class Connection(Thread):
         versions.
         """
         if sys.version_info >= (3, 8):
-            await self._execute(
+            await execute_blocking(
                 self._conn.create_function,
                 name,
                 num_params,
@@ -232,11 +189,8 @@ class Connection(Thread):
                     "non-deterministic as per SQLite defaults.".format(name)
                 )
 
-            await self._execute(
-                self._conn.create_function,
-                name,
-                num_params,
-                func,
+            await execute_blocking(
+                self._conn.create_function, name, num_params, func,
             )
 
     @property
@@ -272,18 +226,18 @@ class Connection(Thread):
         return self._conn.total_changes
 
     async def enable_load_extension(self, value: bool) -> None:
-        await self._execute(self._conn.enable_load_extension, value)  # type: ignore
+        await execute_blocking(self._conn.enable_load_extension, value)  # type: ignore
 
     async def load_extension(self, path: str):
-        await self._execute(self._conn.load_extension, path)  # type: ignore
+        await execute_blocking(self._conn.load_extension, path)  # type: ignore
 
     async def set_progress_handler(
         self, handler: Callable[[], Optional[int]], n: int
     ) -> None:
-        await self._execute(self._conn.set_progress_handler, handler, n)
+        await execute_blocking(self._conn.set_progress_handler, handler, n)
 
     async def set_trace_callback(self, handler: Callable) -> None:
-        await self._execute(self._conn.set_trace_callback, handler)
+        await execute_blocking(self._conn.set_trace_callback, handler)
 
     async def iterdump(self) -> AsyncIterator[str]:
         """
@@ -295,7 +249,7 @@ class Connection(Thread):
                 ...
 
         """
-        dump_queue: Queue = Queue()
+        dump_queue: SimpleQueue = SimpleQueue()
 
         def dumper():
             try:
@@ -308,7 +262,7 @@ class Connection(Thread):
                 dump_queue.put_nowait(None)
                 raise
 
-        fut = self._execute(dumper)
+        fut = execute_blocking(dumper)
         task = asyncio.ensure_future(fut)
 
         while True:
@@ -347,7 +301,7 @@ class Connection(Thread):
         if isinstance(target, Connection):
             target = target._conn
 
-        await self._execute(
+        await execute_blocking(
             self._conn.backup,
             target,
             pages=pages,
